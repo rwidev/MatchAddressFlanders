@@ -148,7 +148,7 @@ def parse_gml_coordinates(gml: object) -> Tuple[str, str]:
 def build_query_params(row: Dict[str, str]) -> Optional[Dict[str, str]]:
     municipal = (row.get("LOM_MUN_NM") or "").strip() or None
     street = (row.get("LOM_ROAD_NM") or "").strip() or None
-    housenumber = (row.get("LOM_HNR_FULL") or "").strip() or None
+    housenumber = (row.get("LOM_SOURCE_HNR") or "").strip() or None
     bus = (row.get("LOM_BOXNR") or "").strip() or None
     postal = (row.get("LOM_POSTAL_CD") or "").strip() or None
 
