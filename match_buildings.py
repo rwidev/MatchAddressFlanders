@@ -104,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         help="Extra sleep in seconds after each processed row (default: %(default)s).",
     )
     parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=100,
+        help="Print a progress message every N rows considered (default: 100). Set to 0 to disable.",
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         help="Limit how many rows are processed (useful for dry-runs).",
@@ -401,10 +407,26 @@ def write_rows(path: str, rows: Iterable[Dict[str, str]], fieldnames: List[str])
     os.replace(temp_name, path)
 
 
-def process_rows(rows: List[Dict[str, str]], args: argparse.Namespace) -> None:
+def process_rows(rows: List[Dict[str, str]], args: argparse.Namespace, source_name: str = "") -> int:
+    """Process rows in-place and return the number of rows actually processed.
+
+    If `source_name` is provided it will be included in progress messages.
+    """
     limiter = RateLimiter(args.rate_limit)
     processed = 0
-    for row in rows:
+    start = time.perf_counter()
+
+    for idx, row in enumerate(rows, start=1):
+        if args.max_rows is not None and processed >= args.max_rows:
+            break
+
+        # Progress feedback
+        if getattr(args, "progress_interval", 0) and args.progress_interval > 0 and idx % args.progress_interval == 0:
+            elapsed = time.perf_counter() - start
+            rate = idx / elapsed if elapsed > 0 else 0.0
+            src = f"[{source_name}] " if source_name else ""
+            print(f"{src}Rows considered: {idx}/{len(rows)} — processed: {processed} — elapsed: {elapsed:.1f}s — {rate:.1f} r/s")
+
         if should_skip(row, args.force):
             continue
 
@@ -469,11 +491,10 @@ def process_rows(rows: List[Dict[str, str]], args: argparse.Namespace) -> None:
         row["gebouwregister_wkt"] = wkt
 
         processed += 1
-        if args.max_rows is not None and processed >= args.max_rows:
-            break
-
         if args.delay:
             time.sleep(args.delay)
+
+    return processed
 
 
 def main() -> None:

@@ -46,7 +46,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "csv_path",
-        help="Path to the input CSV that will be updated in place unless --output is set.",
+        nargs="?",
+        default="./data/input",
+        help="Path to an input CSV file or an input directory containing CSV files (default: ./data/input).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="./data/output",
+        help="Directory to write enriched CSV files when input is a directory (default: ./data/output).",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=100,
+        help="Print a progress message every N rows considered (default: 100). Set to 0 to disable.",
     )
     parser.add_argument(
         "--api-url",
@@ -203,97 +216,102 @@ def extract_spelling(value: Optional[Dict[str, object]]) -> str:
 
 
 def pick_best_match(payload: Dict[str, object]) -> Dict[str, object]:
+    """Return the top adres match from the payload or empty dict."""
     matches = payload.get("adresMatches")
     if isinstance(matches, list) and matches:
         return matches[0]
     return {}
 
 
-def update_row_with_match(row: Dict[str, str], match: Dict[str, object]) -> None:
-    score = match.get("score")
-    adres_obj = match.get("adres") if isinstance(match, dict) else None
-    if not isinstance(adres_obj, dict) and isinstance(match, dict):
-        adres_obj = match
+def _clear_match_fields(row: Dict[str, str]) -> None:
+    """Reset all adresmatch output fields to empty strings."""
+    for name in NEW_COLUMNS:
+        row[name] = ""
 
+
+def _populate_identificator_fields(row: Dict[str, str], adres_obj: Dict[str, object]) -> None:
+    identificator = adres_obj.get("identificator")
+    if isinstance(identificator, dict):
+        adres_uri = identificator.get("id") or adres_obj.get("detail") or ""
+        row["adresmatch_adres_uri"] = str(adres_uri)
+        row["adresmatch_adres_id"] = str(
+            identificator.get("objectId") or identificator.get("lokaleId") or ""
+        )
+        row["adresmatch_identificator_namespace"] = str(
+            identificator.get("naamruimte") or identificator.get("namespace") or ""
+        )
+        row["adresmatch_identificator_version"] = str(
+            identificator.get("versieId") or identificator.get("versie") or ""
+        )
+    else:
+        row["adresmatch_adres_uri"] = str(adres_obj.get("detail") or "")
+        row["adresmatch_adres_id"] = ""
+        row["adresmatch_identificator_namespace"] = ""
+        row["adresmatch_identificator_version"] = ""
+
+
+def _populate_position_fields(row: Dict[str, str], positie: Dict[str, object]) -> None:
+    method = positie.get("positieGeometrieMethode") or positie.get("methode")
+    row["adresmatch_pos_method"] = str(method or "")
+    lon = lat = ""
+
+    geometrie = positie.get("geometrie")
+    if isinstance(geometrie, dict):
+        lon, lat = parse_gml_coordinates(geometrie.get("gml"))
+        if (not lon or not lat) and isinstance(geometrie.get("coordinates"), (list, tuple)):
+            coords = geometrie["coordinates"]
+            if len(coords) >= 2:
+                lon = lon or str(coords[0])
+                lat = lat or str(coords[1])
+
+    if not lon or not lat:
+        punt = positie.get("punt")
+        if isinstance(punt, dict):
+            lon = lon or str(punt.get("xcoordinaat") or "")
+            lat = lat or str(punt.get("ycoordinaat") or "")
+
+    row["adresmatch_pos_lon"] = lon
+    row["adresmatch_pos_lat"] = lat
+
+
+def update_row_with_match(row: Dict[str, str], match: Dict[str, object]) -> None:
+    """Apply match information to `row` using small helper functions."""
+    _clear_match_fields(row)
+
+    score = match.get("score")
     if isinstance(score, (int, float)):
         row["adresmatch_score"] = f"{score:.4f}"
     else:
         row["adresmatch_score"] = ""
 
-    if isinstance(adres_obj, dict):
-        identificator = adres_obj.get("identificator")
-        if isinstance(identificator, dict):
-            adres_uri = identificator.get("id") or adres_obj.get("detail") or ""
-            row["adresmatch_adres_uri"] = str(adres_uri)
-            row["adresmatch_adres_id"] = str(
-                identificator.get("objectId") or identificator.get("lokaleId") or ""
-            )
-            row["adresmatch_identificator_namespace"] = str(
-                identificator.get("naamruimte") or identificator.get("namespace") or ""
-            )
-            row["adresmatch_identificator_version"] = str(
-                identificator.get("versieId") or identificator.get("versie") or ""
-            )
-        else:
-            row["adresmatch_adres_uri"] = str(adres_obj.get("detail") or "")
-            row["adresmatch_adres_id"] = ""
-            row["adresmatch_identificator_namespace"] = ""
-            row["adresmatch_identificator_version"] = ""
+    adres_obj = match.get("adres") if isinstance(match, dict) else None
+    if not isinstance(adres_obj, dict) and isinstance(match, dict):
+        adres_obj = match
 
+    if isinstance(adres_obj, dict):
+        _populate_identificator_fields(row, adres_obj)
         row["adresmatch_gemeente"] = extract_spelling(adres_obj.get("gemeentenaam"))
         row["adresmatch_straatnaam"] = extract_spelling(adres_obj.get("straatnaam"))
         row["adresmatch_huisnummer"] = str(adres_obj.get("huisnummer") or "")
         row["adresmatch_busnummer"] = str(adres_obj.get("busnummer") or "")
         postinfo = adres_obj.get("postinfo")
-        if isinstance(postinfo, dict):
-            row["adresmatch_postcode"] = str(postinfo.get("postnummer") or "")
-        else:
-            row["adresmatch_postcode"] = ""
-
-        addition = adres_obj.get("toevoeging")
-        row["adresmatch_toevoeging"] = str(addition or "")
+        row["adresmatch_postcode"] = str(postinfo.get("postnummer") or "") if isinstance(postinfo, dict) else ""
+        row["adresmatch_toevoeging"] = str(adres_obj.get("toevoeging") or "")
 
         positie = adres_obj.get("adresPositie") or adres_obj.get("positie")
         if isinstance(positie, dict):
-            method = positie.get("positieGeometrieMethode") or positie.get("methode")
-            row["adresmatch_pos_method"] = str(method or "")
-            lon = lat = ""
-            geometrie = positie.get("geometrie")
-            if isinstance(geometrie, dict):
-                lon, lat = parse_gml_coordinates(geometrie.get("gml"))
-                if (not lon or not lat) and isinstance(geometrie.get("coordinates"), (list, tuple)):
-                    coords = geometrie["coordinates"]
-                    if len(coords) >= 2:
-                        lon = lon or str(coords[0])
-                        lat = lat or str(coords[1])
-            if not lon or not lat:
-                punt = positie.get("punt")
-                if isinstance(punt, dict):
-                    lon = lon or str(punt.get("xcoordinaat") or "")
-                    lat = lat or str(punt.get("ycoordinaat") or "")
-            row["adresmatch_pos_lon"] = lon
-            row["adresmatch_pos_lat"] = lat
+            _populate_position_fields(row, positie)
         else:
             row["adresmatch_pos_method"] = ""
             row["adresmatch_pos_lon"] = ""
             row["adresmatch_pos_lat"] = ""
-    else:
-        row["adresmatch_adres_uri"] = ""
-        row["adresmatch_adres_id"] = ""
-        row["adresmatch_identificator_namespace"] = ""
-        row["adresmatch_identificator_version"] = ""
-        row["adresmatch_gemeente"] = ""
-        row["adresmatch_straatnaam"] = ""
-        row["adresmatch_huisnummer"] = ""
-        row["adresmatch_busnummer"] = ""
-        row["adresmatch_postcode"] = ""
-        row["adresmatch_toevoeging"] = ""
-        row["adresmatch_pos_method"] = ""
-        row["adresmatch_pos_lon"] = ""
-        row["adresmatch_pos_lat"] = ""
 
-    row["adresmatch_error"] = ""
-    row["adresmatch_status"] = "matched" if match else "no_match"
+        row["adresmatch_error"] = ""
+        row["adresmatch_status"] = "matched"
+    else:
+        # No match -> set status and keep cleared fields
+        row["adresmatch_error"] = ""
+        row["adresmatch_status"] = "no_match"
 
 
 def write_rows(path: str, rows: Iterable[Dict[str, str]], fieldnames: List[str]) -> None:
@@ -321,62 +339,112 @@ def should_skip_row(row: Dict[str, str], force: bool) -> bool:
     return bool(status)
 
 
-def process_rows(
-    rows: List[Dict[str, str]],
-    args: argparse.Namespace,
-) -> None:
+def _mark_row_missing_input(row: Dict[str, str]) -> None:
+    row["adresmatch_status"] = "missing_input"
+    row["adresmatch_error"] = "Missing municipality/postcode, street, or house number"
+
+
+def _mark_row_error(row: Dict[str, str], exc: Exception) -> None:
+    row["adresmatch_status"] = "error"
+    row["adresmatch_error"] = str(exc)
+
+
+def _process_single_row(row: Dict[str, str], args: argparse.Namespace, limiter: RateLimiter) -> bool:
+    """Process one row; return True when a row was actually processed (counts against --max-rows)."""
+    if should_skip_row(row, args.force):
+        return False
+
+    params = build_query_params(row)
+    if params is None:
+        _mark_row_missing_input(row)
+        return False
+
+    try:
+        limiter.wait()
+        response_json = get_adresmatch(
+            url=args.api_url, params=params, timeout=args.timeout, auth_token=args.auth_token
+        )
+    except Exception as exc:  # pragma: no cover - runtime handling
+        _mark_row_error(row, exc)
+        return False
+
+    match = pick_best_match(response_json)
+    update_row_with_match(row, match)
+
+    if args.delay:
+        time.sleep(args.delay)
+
+    return True
+
+
+def process_rows(rows: List[Dict[str, str]], args: argparse.Namespace, source_name: str = "") -> int:
+    """Process rows in-place and return the number of rows actually queried against the API.
+
+    If `source_name` is provided it is used in progress messages for context.
+    """
     processed = 0
     limiter = RateLimiter(args.rate_limit)
+    start = time.perf_counter()
+
     for idx, row in enumerate(rows, start=1):
         if args.max_rows is not None and processed >= args.max_rows:
             break
 
-        if should_skip_row(row, args.force):
-            continue
+        # Progress feedback
+        if getattr(args, "progress_interval", 0) and args.progress_interval > 0 and idx % args.progress_interval == 0:
+            elapsed = time.perf_counter() - start
+            rate = idx / elapsed if elapsed > 0 else 0.0
+            src = f"[{source_name}] " if source_name else ""
+            print(f"{src}Rows considered: {idx}/{len(rows)} — queried: {processed} — elapsed: {elapsed:.1f}s — {rate:.1f} r/s")
 
-        params = build_query_params(row)
-        if params is None:
-            row["adresmatch_status"] = "missing_input"
-            row["adresmatch_error"] = "Missing municipality/postcode, street, or house number"
-            continue
+        if _process_single_row(row, args, limiter):
+            processed += 1
+    return processed
 
-        try:
-            # print(
-            #     "[adresmatch] GET",
-            #     f"{args.api_url}?{urlencode(params)}",
-            # )
-            limiter.wait()
-            response_json = get_adresmatch(
-                url=args.api_url,
-                params=params,
-                timeout=args.timeout,
-                auth_token=args.auth_token,
-            )
-            # print(
-            #     "[adresmatch] RESPONSE",
-            #     json.dumps(response_json, ensure_ascii=False, separators=(",", ":")),
-            # )
-        except Exception as exc:  # pragma: no cover - strictly runtime handling
-            row["adresmatch_status"] = "error"
-            row["adresmatch_error"] = str(exc)
-            continue
 
-        match = pick_best_match(response_json)
-        update_row_with_match(row, match)
-
-        processed += 1
-        if args.delay:
-            time.sleep(args.delay)
+import glob
 
 
 def main() -> None:
     args = parse_args()
-    rows, fieldnames = load_rows(args.csv_path)
-    ordered_fields = ensure_field_order(fieldnames)
-    process_rows(rows, args)
-    output_path = args.output or args.csv_path
-    write_rows(output_path, rows, ordered_fields)
-    print(f"Processed {len(rows)} rows. Updated file saved to {output_path}.")
+    input_path = args.csv_path
+
+    # Gather input files: either a single file or all CSVs in a directory
+    if os.path.isdir(input_path):
+        input_files = sorted(glob.glob(os.path.join(input_path, "*.csv")))
+        if not input_files:
+            print(f"No CSV files found in {input_path}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        input_files = [input_path]
+
+    if getattr(args, "output", None) and len(input_files) > 1:
+        print("Cannot use --output with multiple input files. Use --output-dir instead.", file=sys.stderr)
+        sys.exit(1)
+
+    total_processed = 0
+    total_rows = 0
+    for in_file in input_files:
+        rows, fieldnames = load_rows(in_file)
+        ordered_fields = ensure_field_order(fieldnames)
+        processed = process_rows(rows, args)
+
+        output_path = (
+            args.output
+            if getattr(args, "output", None)
+            else os.path.join(args.output_dir, os.path.basename(in_file))
+        )
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        write_rows(output_path, rows, ordered_fields)
+
+        print(
+            f"Processed {processed} rows (queried), {len(rows)} total rows. Updated file saved to {output_path}."
+        )
+        total_processed += processed
+        total_rows += len(rows)
+
+    if len(input_files) > 1:
+        print(f"Total: Processed {total_processed} rows (queried), {total_rows} total rows across {len(input_files)} files.")
 
 
 if __name__ == "__main__":
